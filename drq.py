@@ -29,24 +29,26 @@ class Encoder(nn.Module):
         assert len(obs_shape) == 3
         self.num_layers = 4
         self.num_filters = 32
-        self.output_dim = 35
+        self.output_dim = 25
         self.output_logits = False
         self.feature_dim = feature_dim
 
         self.convs = nn.ModuleList([
-            nn.Conv2d(obs_shape[0], self.num_filters, 3, stride=2),
+            nn.Conv2d(obs_shape[-1], self.num_filters, 3, stride=2),
             nn.Conv2d(self.num_filters, self.num_filters, 3, stride=1),
             nn.Conv2d(self.num_filters, self.num_filters, 3, stride=1),
             nn.Conv2d(self.num_filters, self.num_filters, 3, stride=1)
         ])
 
         self.head = nn.Sequential(
-            nn.Linear(self.num_filters * 35 * 35, self.feature_dim),
+            nn.Linear(self.num_filters * self.output_dim * self.output_dim, self.feature_dim),
             nn.LayerNorm(self.feature_dim))
 
         self.outputs = dict()
 
     def forward_conv(self, obs):
+        if obs.shape[-1] == 3 or obs.shape[-1] == 9:
+            obs = obs.permute(0, 3, 1, 2)
         obs = obs / 255.
         self.outputs['obs'] = obs
 
@@ -57,7 +59,7 @@ class Encoder(nn.Module):
             conv = torch.relu(self.convs[i](conv))
             self.outputs['conv%s' % (i + 1)] = conv
 
-        h = conv.view(conv.size(0), -1)
+        h = conv.reshape((conv.size(0), -1))
         return h
 
     def forward(self, obs, detach=False):
@@ -453,6 +455,7 @@ class DRQAgent(object):
 
         # Calculate log p(z|s) using cross-entropy trick or manual log_softmax
         # skill is [batch_size, 1], .long() for gather
+        skill = skill.reshape((-1, 1))
         log_p_z_s = F.log_softmax(skill_logits, dim=-1).gather(1, skill.long())
 
         # Calculate log p(z) - assuming a uniform prior over skills
@@ -461,7 +464,7 @@ class DRQAgent(object):
 
         intrinsic_reward = log_p_z_s - log_p_z_uniform
 
-        return intrinsic_reward.view(-1, 1) # Ensure shape [batch_size, 1]
+        return intrinsic_reward.reshape((-1, 1)) # Ensure shape [batch_size, 1]
 
     def update_discriminator(self, obs, skill, logger, step):
         """

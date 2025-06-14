@@ -17,7 +17,7 @@ import time
 import pickle as pkl
 import argparse
 
-import dmc2gym
+# import dmc2gym
 # import hydra # Hydra configuration is replaced by argparse
 import utils
 from logger import Logger # Handles logging to console, CSVs, and TensorBoard
@@ -25,44 +25,46 @@ from replay_buffer import ReplayBuffer
 from video import VideoRecorder
 import drq # Import drq directly for DRQAgent
 
+from envs import make_env
+
 torch.backends.cudnn.benchmark = True
 
 
-def make_env(args):
-    """
-    Helper function to create a dm_control environment.
-    Uses args to specify environment name, seed, image size, action repeat, etc.
-    """
-    if args.env == 'ball_in_cup_catch':
-        domain_name = 'ball_in_cup'
-        task_name = 'catch'
-    elif args.env == 'point_mass_easy':
-        domain_name = 'point_mass'
-        task_name = 'easy'
-    else:
-        domain_name = args.env.split('_')[0]
-        task_name = '_'.join(args.env.split('_')[1:])
+# def make_env(args):
+#     """
+#     Helper function to create a dm_control environment.
+#     Uses args to specify environment name, seed, image size, action repeat, etc.
+#     """
+#     if args.task == 'ball_in_cup_catch':
+#         domain_name = 'ball_in_cup'
+#         task_name = 'catch'
+#     elif args.task == 'point_mass_easy':
+#         domain_name = 'point_mass'
+#         task_name = 'easy'
+#     else:
+#         domain_name = args.task.split('_')[0]
+#         task_name = '_'.join(args.task.split('_')[1:])
 
-    # per dreamer: https://github.com/danijar/dreamer/blob/02f0210f5991c7710826ca7881f19c64a012290c/wrappers.py#L26
-    camera_id = 2 if domain_name == 'quadruped' else 0
+#     # per dreamer: https://github.com/danijar/dreamer/blob/02f0210f5991c7710826ca7881f19c64a012290c/wrappers.py#L26
+#     camera_id = 2 if domain_name == 'quadruped' else 0
 
-    env = dmc2gym.make(domain_name=domain_name,
-                       task_name=task_name,
-                       seed=args.seed,
-                       visualize_reward=False,
-                       from_pixels=True,
-                       height=args.image_size,
-                       width=args.image_size,
-                       frame_skip=args.action_repeat,
-                       camera_id=camera_id)
+#     env = dmc2gym.make(domain_name=domain_name,
+#                        task_name=task_name,
+#                        seed=args.seed,
+#                        visualize_reward=False,
+#                        from_pixels=True,
+#                        height=args.render_size,
+#                        width=args.render_size,
+#                        frame_skip=args.action_repeat,
+#                        camera_id=camera_id)
 
-    env = utils.FrameStack(env, k=args.frame_stack)
+#     env = utils.FrameStack(env, k=args.frame_stack)
 
-    env.seed(args.seed)
-    assert env.action_space.low.min() >= -1
-    assert env.action_space.high.max() <= 1
+#     env.seed(args.seed)
+#     assert env.action_space.low.min() >= -1
+#     assert env.action_space.high.max() <= 1
 
-    return env
+#     return env
 
 
 class Workspace(object):
@@ -74,7 +76,7 @@ class Workspace(object):
     def __init__(self, args):
         self.args = args
         # Create working directory for logs and outputs
-        self.work_dir = f'./runs/{args.env}/{time.strftime("%Y%m%d-%H%M%S")}_seed{args.seed}'
+        self.work_dir = f'./runs/{args.task}/{time.strftime("%Y%m%d-%H%M%S")}_seed{args.seed}'
         os.makedirs(self.work_dir, exist_ok=True)
         print(f'Workspace directory: {self.work_dir}')
 
@@ -82,21 +84,21 @@ class Workspace(object):
         self.logger = Logger(self.work_dir,
                              save_tb=args.log_save_tb,
                              log_frequency=args.log_frequency_step,
-                             agent=args.env,
+                             agent=args.agent,
                              action_repeat=args.action_repeat)
 
         utils.set_seed_everywhere(args.seed) # Set random seeds for reproducibility
         self.device = torch.device(args.device) # Set device (cuda/cpu)
-        self.env = make_env(args) # Create the DMC environment
+        self.env = make_env(mode="train", config=args) # Create the DMC environment
 
         # Determine camera_id for VideoRecorder based on environment
-        camera_id = 2 if args.env.startswith('quadruped') else 0
+        camera_id = 2 if args.task.startswith('quadruped') else 0
 
         # Prepare parameters for DRQAgent instantiation from args
         agent_params = {
-            'obs_shape': self.env.observation_space.shape,
-            'action_shape': self.env.action_space.shape,
-            'action_range': [float(self.env.action_space.low.min()), float(self.env.action_space.high.max())],
+            'obs_shape': self.env.obs_space["image"].shape,
+            'action_shape': self.env.act_space["action"].shape,
+            'action_range': [float(self.env.act_space["action"].low.min()), float(self.env.act_space["action"].high.max())],
             'device': self.device,
             'feature_dim': args.encoder_feature_dim,
             'critic_hidden_dim': args.critic_hidden_dim,
@@ -123,16 +125,16 @@ class Workspace(object):
         self.agent = drq.DRQAgent(**agent_params)
 
         # Initialize Replay Buffer
-        self.replay_buffer = ReplayBuffer(self.env.observation_space.shape,
-                                          self.env.action_space.shape,
+        self.replay_buffer = ReplayBuffer(self.env.obs_space['image'].shape,
+                                          self.env.act_space['action'].shape,
                                           args.replay_buffer_capacity,
                                           args.image_pad, self.device)
 
         # Initialize Video Recorder
         self.video_recorder = VideoRecorder(
             self.work_dir if args.save_video else None, # Only enable if save_video is true
-            height=args.image_size,
-            width=args.image_size,
+            height=args.render_size,
+            width=args.render_size,
             camera_id=camera_id,
             fps=25                  # Standardized FPS for recordings
         )
@@ -156,7 +158,8 @@ class Workspace(object):
         if self.num_skills == 0: # Standard evaluation (no skills)
             total_episode_reward_sum = 0 # Sum of rewards over all evaluation episodes
             for episode_idx in range(self.args.num_eval_episodes):
-                obs = self.env.reset()
+                timestep = self.env.reset()
+                obs = timestep['image']
                 current_eval_skill = 0 # Default skill for non-DIAYN agent.act
                 self.video_recorder.init(enabled=(episode_idx == 0 and self.args.save_video), skill_id=current_eval_skill)
                 done = False
@@ -164,15 +167,17 @@ class Workspace(object):
                 while not done:
                     with utils.eval_mode(self.agent): # Set agent to evaluation mode
                         action = self.agent.act(obs, current_eval_skill, sample=False)
-                    next_obs, reward, done, info = self.env.step(action)
-                    self.video_recorder.record(self.env, intrinsic_reward=None) # No intrinsic reward overlay
+                    timestep = self.env.step({'action': action})
+                    next_obs, reward, done = timestep['image'], timestep['reward'], timestep['is_terminal']
+                    self.video_recorder.record(obs[:, :, :3], intrinsic_reward=None) # No intrinsic reward overlay
                     episode_extrinsic_reward += reward
                     obs = next_obs
                 total_episode_reward_sum += episode_extrinsic_reward
 
                 if episode_idx == 0 and self.args.save_video:
-                    self.video_recorder.save(f'{self.step}_skill_{current_eval_skill}.mp4')
                     self.logger.log_video(f'eval/skill_{current_eval_skill}/video', self.video_recorder.frames, self.step, fps=self.video_recorder.fps)
+                    self.video_recorder.save(f'{self.step}_skill_{current_eval_skill}.mp4')
+                    
 
                 # Log data for this evaluation episode to CSV
                 log_data = {
@@ -190,7 +195,8 @@ class Workspace(object):
                 total_extrinsic_reward_for_skill = 0
                 total_intrinsic_reward_sum_for_skill = 0
                 for episode_idx in range(self.args.num_eval_episodes):
-                    obs = self.env.reset()
+                    timestep = self.env.reset()
+                    obs = timestep['image']
                     self.video_recorder.init(enabled=(episode_idx == 0 and self.args.save_video), skill_id=eval_skill_id)
                     done = False
                     current_episode_extrinsic_reward = 0
@@ -199,15 +205,15 @@ class Workspace(object):
                     while not done:
                         with utils.eval_mode(self.agent):
                             action = self.agent.act(obs, eval_skill_id, sample=False) # Act using the current eval_skill_id
-                        next_obs, reward, done, info = self.env.step(action)
-
+                        timestep = self.env.step({'action': action})
+                        next_obs, reward, done = timestep['image'], timestep['reward'], timestep['is_terminal']
                         # Compute and accumulate intrinsic reward for this step
                         current_skill_tensor = torch.tensor([eval_skill_id], device=self.device).long()
                         obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
                         intrinsic_reward = self.agent.compute_intrinsic_reward(obs_tensor, current_skill_tensor).item()
                         current_episode_intrinsic_reward_sum += intrinsic_reward
 
-                        self.video_recorder.record(self.env, intrinsic_reward=intrinsic_reward) # Record frame with IR
+                        self.video_recorder.record(obs[:, :, :3], intrinsic_reward=intrinsic_reward) # Record frame with IR
                         current_episode_extrinsic_reward += reward
                         obs = next_obs
 
@@ -215,8 +221,9 @@ class Workspace(object):
                     total_intrinsic_reward_sum_for_skill += current_episode_intrinsic_reward_sum
 
                     if episode_idx == 0 and self.args.save_video:
-                         self.video_recorder.save(f'{self.step}_skill_{eval_skill_id}.mp4')
                          self.logger.log_video(f'eval/skill_{eval_skill_id}/video', self.video_recorder.frames, self.step, fps=self.video_recorder.fps)
+                         self.video_recorder.save(f'{self.step}_skill_{eval_skill_id}.mp4') # save step will emptify frames
+                         
 
                     # Log data for this evaluation episode to CSV
                     log_data = {
@@ -276,7 +283,8 @@ class Workspace(object):
                     self.evaluate()
 
                 # Reset environment and episode-specific counters for the new episode
-                obs = self.env.reset()
+                timestep = self.env.reset()
+                obs = timestep['image']
                 done = False
                 current_episode_extrinsic_reward = 0
                 current_episode_intrinsic_reward_sum = 0
@@ -295,7 +303,7 @@ class Workspace(object):
 
             # Sample action from agent
             if self.step < self.args.num_seed_steps: # Random actions for seed steps
-                action = self.env.action_space.sample()
+                action = self.env.act_space['action'].sample()
             else: # Policy actions
                 with utils.eval_mode(self.agent): # Use agent in eval mode for action selection
                     action = self.agent.act(obs_for_replay_buffer, self.current_skill_train, sample=True)
@@ -306,7 +314,8 @@ class Workspace(object):
                     self.agent.update(self.replay_buffer, self.logger, self.step)
 
             # Take step in the environment
-            next_obs, reward, done, info = self.env.step(action)
+            timestep = self.env.step({'action': action})
+            next_obs, reward, done = timestep['image'], timestep['reward'], timestep['is_terminal']
 
             current_episode_extrinsic_reward += reward # Accumulate extrinsic reward
 
@@ -319,11 +328,11 @@ class Workspace(object):
 
             # Handle 'done' for replay buffer (distinguish timeout from actual done)
             done_float = float(done)
-            done_no_max = 0 if episode_step + 1 == self.env._max_episode_steps else done_float
+            # done_no_max = 0 if episode_step + 1 == self.env._max_episode_steps else done_float
 
             # Add transition to replay buffer
             self.replay_buffer.add(obs_for_replay_buffer, action, reward, next_obs, done_float,
-                                   done_no_max, self.current_skill_train)
+                                   done_float, self.current_skill_train)
 
             obs = next_obs # Update observation for next step
             episode_step += 1
@@ -333,9 +342,13 @@ class Workspace(object):
 def main():
     parser = argparse.ArgumentParser(description="Train DrQ agent with optional DIAYN skill discovery.")
 
+    parser.add_argument('--agent', type=str, default="drq")
     # Environment arguments
-    parser.add_argument('--env', type=str, default='cartpole_swingup', help='Environment name from dm_control suite.')
+    parser.add_argument('--task', type=str, default='dmc_cartpole_swingup', help='Environment name from dm_control suite.')
     parser.add_argument('--action_repeat', type=int, default=4, help='Number of times an action is repeated.')
+    parser.add_argument('--time_limit', type=int, default=1, help="the maximum steps of one episode")
+    parser.add_argument('--dmc_camera', type=int, default=-1)
+    parser.add_argument('--camera', type=str, default='corner')
 
     # Training lifecycle arguments
     parser.add_argument('--num_train_steps', type=int, default=1000000, help='Total number of environment steps for training.')
@@ -346,7 +359,7 @@ def main():
 
     # Evaluation arguments
     parser.add_argument('--eval_frequency', type=int, default=5000, help='Frequency (in steps) of evaluation phases.')
-    parser.add_argument('--num_eval_episodes', type=int, default=10, help='Number of episodes per evaluation phase (and per skill if DIAYN).')
+    parser.add_argument('--num_eval_episodes', type=int, default=1, help='Number of episodes per evaluation phase (and per skill if DIAYN).')
 
     # Logging and miscellaneous arguments
     parser.add_argument('--log_frequency_step', type=int, default=10000, help='Frequency (in steps) for aggregated CSV/console logs.')
@@ -355,9 +368,9 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (e.g., "cuda", "cpu").')
 
     # Observation arguments
-    parser.add_argument('--image_size', type=int, default=84, help='Size of input images (height and width).')
+    parser.add_argument('--render_size', type=int, default=64, help='Size of input images (height and width).')
     parser.add_argument('--image_pad', type=int, default=4, help='Padding for image augmentation.')
-    parser.add_argument('--frame_stack', type=int, default=3, help='Number of consecutive frames to stack as observation.')
+    parser.add_argument('--framestack', type=int, default=3, help='Number of consecutive frames to stack as observation.')
 
     # Core RL algorithm arguments (learning rates, batch size, SAC params)
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate for actor, critic, and SAC alpha.')

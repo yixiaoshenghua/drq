@@ -69,20 +69,20 @@ class VideoRecorder(object):
         if isinstance(frame, np.ndarray) and not frame.flags.writeable:
             frame = frame.copy()
 
-        if intrinsic_reward is not None:
-            # Convert frame to BGR format for OpenCV text rendering
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            text = f"IR: {intrinsic_reward:.4f}" # Format intrinsic reward
-            # Define text properties
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.7
-            font_color = (0, 255, 0)  # Green color in BGR
-            thickness = 2
-            text_position = (10, 30)  # Position (x, y) from top-left
-            # Add text to frame
-            cv2.putText(frame_bgr, text, text_position, font, font_scale, font_color, thickness, cv2.LINE_AA)
-            # Convert frame back to RGB for storage/display
-            frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        # if intrinsic_reward is not None:
+        #     # Convert frame to BGR format for OpenCV text rendering
+        #     frame_bgr = cv2.cvtColor(cv2.resize(frame, (256, 256)), cv2.COLOR_RGB2BGR)
+        #     text = f"IR: {intrinsic_reward:.4f}" # Format intrinsic reward
+        #     # Define text properties
+        #     font = cv2.FONT_HERSHEY_SIMPLEX
+        #     font_scale = 0.3
+        #     font_color = (0, 255, 0)  # Green color in BGR
+        #     thickness = 2
+        #     text_position = (15, 15)  # Position (x, y) from top-left
+        #     # Add text to frame
+        #     cv2.putText(frame_bgr, text, text_position, font, font_scale, font_color, thickness, cv2.LINE_AA)
+        #     # Convert frame back to RGB for storage/display
+        #     frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
         self.frames.append(frame)
 

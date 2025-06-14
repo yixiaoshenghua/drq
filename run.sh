@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES="0" python train.py --task dmc_walker_run --num_skills 10 --num_train_steps 1000000 --encoder_feature_dim 50 --lr 3e-4 --lr_discriminator 3e-4 --save_video True --log_save_tb True --time_limit 1000 --action_repeat 2 --framestack 3 --num_eval_episodes 1

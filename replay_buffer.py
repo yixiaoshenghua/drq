@@ -15,7 +15,7 @@ class ReplayBuffer(object):
 
         self.aug_trans = nn.Sequential(
             nn.ReplicationPad2d(image_pad),
-            kornia.augmentation.RandomCrop((obs_shape[-1], obs_shape[-1])))
+            kornia.augmentation.RandomCrop((obs_shape[0], obs_shape[0])))
 
         self.obses = np.empty((capacity, *obs_shape), dtype=np.uint8)
         self.next_obses = np.empty((capacity, *obs_shape), dtype=np.uint8)
@@ -67,6 +67,15 @@ class ReplayBuffer(object):
         # DIAYN: Sample skills along with other data
         skills = torch.as_tensor(self.skills[idxs], device=self.device).long() # Skills converted to long tensor
 
+        if obses.shape[-1] == 3 or obses.shape[-1] == 9:
+            obses = obses.permute(0, 3, 1, 2)
+        if next_obses.shape[-1] == 3 or next_obses.shape[-1] == 9:
+            next_obses = next_obses.permute(0, 3, 1, 2)
+        if obses_aug.shape[-1] == 3 or obses_aug.shape[-1] == 9:
+            obses_aug = obses_aug.permute(0, 3, 1, 2)
+        if next_obses_aug.shape[-1] == 3 or next_obses_aug.shape[-1] == 9:
+            next_obses_aug = next_obses_aug.permute(0, 3, 1, 2)
+        
         obses = self.aug_trans(obses)
         next_obses = self.aug_trans(next_obses)
 
