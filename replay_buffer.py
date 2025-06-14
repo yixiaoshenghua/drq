@@ -24,19 +24,23 @@ class ReplayBuffer(object):
         self.not_dones = np.empty((capacity, 1), dtype=np.float32)
         self.not_dones_no_max = np.empty((capacity, 1), dtype=np.float32)
 
+        # DIAYN: Add storage for skills
+        self.skills = np.empty((capacity, 1), dtype=np.int64) # Skill IDs are integers
+
         self.idx = 0
         self.full = False
 
     def __len__(self):
         return self.capacity if self.full else self.idx
 
-    def add(self, obs, action, reward, next_obs, done, done_no_max):
+    def add(self, obs, action, reward, next_obs, done, done_no_max, skill): # Added skill argument for DIAYN
         np.copyto(self.obses[self.idx], obs)
         np.copyto(self.actions[self.idx], action)
         np.copyto(self.rewards[self.idx], reward)
         np.copyto(self.next_obses[self.idx], next_obs)
         np.copyto(self.not_dones[self.idx], not done)
         np.copyto(self.not_dones_no_max[self.idx], not done_no_max)
+        np.copyto(self.skills[self.idx], skill) # Store the skill
 
         self.idx = (self.idx + 1) % self.capacity
         self.full = self.full or self.idx == 0
@@ -60,6 +64,8 @@ class ReplayBuffer(object):
         rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
         not_dones_no_max = torch.as_tensor(self.not_dones_no_max[idxs],
                                            device=self.device)
+        # DIAYN: Sample skills along with other data
+        skills = torch.as_tensor(self.skills[idxs], device=self.device).long() # Skills converted to long tensor
 
         obses = self.aug_trans(obses)
         next_obses = self.aug_trans(next_obses)
@@ -67,4 +73,4 @@ class ReplayBuffer(object):
         obses_aug = self.aug_trans(obses_aug)
         next_obses_aug = self.aug_trans(next_obses_aug)
 
-        return obses, actions, rewards, next_obses, not_dones_no_max, obses_aug, next_obses_aug
+        return obses, actions, rewards, next_obses, not_dones_no_max, obses_aug, next_obses_aug, skills

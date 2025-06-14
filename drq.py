@@ -6,11 +6,23 @@ import copy
 import math
 
 import utils
-import hydra
+# import hydra # Hydra is no longer used for configuration.
+
+# Note: The 'hydra' import might still be present in 'utils.py'.
+# If 'utils.py' relies on hydra for specific functionalities like 'hydra.utils.instantiate'
+# for other purposes not refactored yet, this conditional import helps.
+# Ideally, 'utils.py' would also be made independent of Hydra if all usages are removed.
+try:
+    import hydra
+except ImportError:
+    pass
 
 
 class Encoder(nn.Module):
-    """Convolutional encoder for image-based observations."""
+    """
+    Convolutional encoder for image-based observations.
+    Takes an observation and outputs a flat feature vector.
+    """
     def __init__(self, obs_shape, feature_dim):
         super().__init__()
 
@@ -78,24 +90,66 @@ class Encoder(nn.Module):
 
 
 class Actor(nn.Module):
-    """torch.distributions implementation of an diagonal Gaussian policy."""
-    def __init__(self, encoder_cfg, action_shape, hidden_dim, hidden_depth,
-                 log_std_bounds):
+    """
+    Actor network (policy) for DrQ. Outputs a distribution over actions.
+    Can be skill-conditioned for DIAYN.
+    """
+    def __init__(self, obs_shape, feature_dim, action_shape, hidden_dim, hidden_depth,
+                 log_std_bounds, num_skills, skill_embedding_dim):
+        """
+        Args:
+            obs_shape (tuple): Shape of the observation space.
+            feature_dim (int): Dimension of the features from the encoder.
+            action_shape (tuple): Shape of the action space.
+            hidden_dim (int): Dimension of hidden layers in the MLP.
+            hidden_depth (int): Number of hidden layers in the MLP.
+            log_std_bounds (list/tuple): Min and max values for log_std.
+            num_skills (int): Number of skills for DIAYN. If 0, DIAYN is not used.
+            skill_embedding_dim (int): Dimension for skill embeddings if num_skills > 0.
+        """
         super().__init__()
 
-        self.encoder = hydra.utils.instantiate(encoder_cfg)
+        self.encoder = Encoder(obs_shape, feature_dim)
+        self.num_skills = num_skills
+        self.skill_embedding_dim = skill_embedding_dim
+
+        # Determine input dimension for the policy's MLP trunk
+        trunk_input_dim = self.encoder.feature_dim
+        if self.num_skills > 0:
+            self.skill_embedding = nn.Embedding(num_skills, skill_embedding_dim)
+            trunk_input_dim += skill_embedding_dim
 
         self.log_std_bounds = log_std_bounds
-        self.trunk = utils.mlp(self.encoder.feature_dim, hidden_dim,
+        # MLP trunk outputs parameters for the action distribution (mean and log_std)
+        self.trunk = utils.mlp(trunk_input_dim, hidden_dim,
                                2 * action_shape[0], hidden_depth)
 
-        self.outputs = dict()
-        self.apply(utils.weight_init)
+        self.outputs = dict() # For logging intermediate activations
+        self.apply(utils.weight_init) # Apply weight initialization
 
-    def forward(self, obs, detach_encoder=False):
-        obs = self.encoder(obs, detach=detach_encoder)
+    def forward(self, obs, skill=None, detach_encoder=False):
+        """
+        Forward pass of the actor.
+        Args:
+            obs (torch.Tensor): Batch of observations.
+            skill (torch.Tensor, optional): Batch of skills, if DIAYN is used.
+            detach_encoder (bool): Whether to detach the encoder features from the graph.
+        Returns:
+            SquashedNormal distribution over actions.
+        """
+        obs_features = self.encoder(obs, detach=detach_encoder)
 
-        mu, log_std = self.trunk(obs).chunk(2, dim=-1)
+        # If skill-conditioned, concatenate skill embedding with observation features
+        if self.num_skills > 0:
+            if skill is None:
+                raise ValueError("Skill must be provided when num_skills > 0 for DIAYN Actor.")
+            # skill shape expected: (batch_size, 1) or (batch_size,)
+            skill_emb = self.skill_embedding(skill.long().squeeze(-1)) # Squeeze to handle (B,1) -> (B)
+            combined_features = torch.cat([obs_features, skill_emb], dim=-1)
+        else:
+            combined_features = obs_features
+
+        mu, log_std = self.trunk(combined_features).chunk(2, dim=-1)
 
         # constrain log_std inside [log_std_min, log_std_max]
         log_std = torch.tanh(log_std)
@@ -120,25 +174,47 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    """Critic network, employes double Q-learning."""
-    def __init__(self, encoder_cfg, action_shape, hidden_dim, hidden_depth):
+    """
+    Critic network for DrQ. Implements double Q-learning (two Q-functions).
+    It takes observations and actions to predict Q-values.
+    """
+    def __init__(self, obs_shape, feature_dim, action_shape, hidden_dim, hidden_depth):
+        """
+        Args:
+            obs_shape (tuple): Shape of the observation space.
+            feature_dim (int): Dimension of the features from the encoder.
+            action_shape (tuple): Shape of the action space.
+            hidden_dim (int): Dimension of hidden layers in the MLP.
+            hidden_depth (int): Number of hidden layers in the MLP.
+        """
         super().__init__()
 
-        self.encoder = hydra.utils.instantiate(encoder_cfg)
+        self.encoder = Encoder(obs_shape, feature_dim)
 
-        self.Q1 = utils.mlp(self.encoder.feature_dim + action_shape[0],
-                            hidden_dim, 1, hidden_depth)
+        # MLP for the first Q-function
+        self.Q1 = utils.mlp(self.encoder.feature_dim + action_shape[0], # Input: encoded_obs + action
+                            hidden_dim, 1, hidden_depth) # Output: Q-value
+        # MLP for the second Q-function (for double Q-learning)
         self.Q2 = utils.mlp(self.encoder.feature_dim + action_shape[0],
                             hidden_dim, 1, hidden_depth)
 
-        self.outputs = dict()
+        self.outputs = dict() # For logging
         self.apply(utils.weight_init)
 
     def forward(self, obs, action, detach_encoder=False):
+        """
+        Forward pass of the critic.
+        Args:
+            obs (torch.Tensor): Batch of observations.
+            action (torch.Tensor): Batch of actions.
+            detach_encoder (bool): Whether to detach the encoder features.
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Q1 and Q2 values.
+        """
         assert obs.size(0) == action.size(0)
-        obs = self.encoder(obs, detach=detach_encoder)
+        obs_features = self.encoder(obs, detach=detach_encoder)
 
-        obs_action = torch.cat([obs, action], dim=-1)
+        obs_action = torch.cat([obs_features, action], dim=-1) # Concatenate features and actions
         q1 = self.Q1(obs_action)
         q2 = self.Q2(obs_action)
 
@@ -162,41 +238,62 @@ class Critic(nn.Module):
 
 
 class DRQAgent(object):
-    """Data regularized Q: actor-critic method for learning from pixels."""
-    def __init__(self, obs_shape, action_shape, action_range, device,
-                 encoder_cfg, critic_cfg, actor_cfg, discount,
-                 init_temperature, lr, actor_update_frequency, critic_tau,
-                 critic_target_update_frequency, batch_size):
+    """
+    DrQ agent with DIAYN skill discovery integration.
+    Manages the actor, critic, discriminator, and their updates.
+    Configuration is now passed via explicit arguments (formerly Hydra).
+    """
+    def __init__(self,
+                 obs_shape, action_shape, action_range, device, # Core RL setup
+                 feature_dim, # Encoder specific
+                 critic_hidden_dim, critic_hidden_depth, # Critic specific
+                 actor_hidden_dim, actor_hidden_depth, actor_log_std_min, actor_log_std_max, # Actor specific
+                 num_skills, skill_embedding_dim, diayn_intrinsic_reward_coeff, # DIAYN specific
+                 discriminator_hidden_dim, discriminator_hidden_depth, # Discriminator specific
+                 discount, init_temperature, lr, lr_discriminator, # RL algorithm HPs & optimizers
+                 actor_update_frequency, critic_tau, critic_target_update_frequency, batch_size # Update rules
+                 ):
         self.action_range = action_range
         self.device = device
         self.discount = discount
-        self.critic_tau = critic_tau
+        self.critic_tau = critic_tau # Soft update coefficient for target critic
         self.actor_update_frequency = actor_update_frequency
         self.critic_target_update_frequency = critic_target_update_frequency
         self.batch_size = batch_size
 
-        self.actor = hydra.utils.instantiate(actor_cfg).to(self.device)
+        # DIAYN specific attributes
+        self.diayn_intrinsic_reward_coeff = diayn_intrinsic_reward_coeff
+        self.num_skills = num_skills
 
-        self.critic = hydra.utils.instantiate(critic_cfg).to(self.device)
-        self.critic_target = hydra.utils.instantiate(critic_cfg).to(
-            self.device)
-        self.critic_target.load_state_dict(self.critic.state_dict())
+        # Instantiate Actor network
+        self.actor = Actor(obs_shape, feature_dim, action_shape, actor_hidden_dim, actor_hidden_depth,
+                           [actor_log_std_min, actor_log_std_max], num_skills, skill_embedding_dim).to(device)
 
-        # tie conv layers between actor and critic
+        # Instantiate Critic network (and target critic)
+        self.critic = Critic(obs_shape, feature_dim, action_shape, critic_hidden_dim, critic_hidden_depth).to(device)
+        self.critic_target = Critic(obs_shape, feature_dim, action_shape, critic_hidden_dim, critic_hidden_depth).to(device)
+        self.critic_target.load_state_dict(self.critic.state_dict()) # Initialize target critic weights
+
+        # Important: Tie convolutional layers between actor's and critic's encoders for shared representation
         self.actor.encoder.copy_conv_weights_from(self.critic.encoder)
 
+        # Entropy temperature alpha for SAC
         self.log_alpha = torch.tensor(np.log(init_temperature)).to(device)
         self.log_alpha.requires_grad = True
-        # set target entropy to -|A|
-        self.target_entropy = -action_shape[0]
+        self.target_entropy = -action_shape[0] # Target entropy is usually -|A|
 
-        # optimizers
+        # Optimizers
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(),
-                                                 lr=lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
         self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
 
-        self.train()
+        # DIAYN: Instantiate Discriminator and its optimizer
+        # feature_dim here is the output dim of the shared encoder (from critic/actor)
+        self.discriminator = Discriminator(feature_dim, num_skills,
+                                           discriminator_hidden_dim, discriminator_hidden_depth).to(device)
+        self.discriminator_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=lr_discriminator)
+
+        self.train() # Set networks to training mode
         self.critic_target.train()
 
     def train(self, training=True):
@@ -208,39 +305,58 @@ class DRQAgent(object):
     def alpha(self):
         return self.log_alpha.exp()
 
-    def act(self, obs, sample=False):
+    def act(self, obs, skill, sample=False):
+        """Selects an action based on observation and current skill (if DIAYN active)."""
         obs = torch.FloatTensor(obs).to(self.device)
-        obs = obs.unsqueeze(0)
-        dist = self.actor(obs)
-        action = dist.sample() if sample else dist.mean
-        action = action.clamp(*self.action_range)
-        assert action.ndim == 2 and action.shape[0] == 1
-        return utils.to_np(action[0])
+        obs = obs.unsqueeze(0) # Add batch dimension
+
+        # Prepare skill tensor for actor
+        # Skill is expected to be a scalar int by this point from Workspace
+        skill_tensor = torch.tensor([skill], device=self.device).long()
+        if self.num_skills > 0 and skill_tensor.ndim == 1: # Actor expects batched skill input
+             skill_tensor = skill_tensor.unsqueeze(0) # Shape: [1,1] or [1] -> [1,1] for consistency with batching
+
+        dist = self.actor(obs, skill_tensor if self.num_skills > 0 else None) # Pass skill to actor
+        action = dist.sample() if sample else dist.mean # Sample or take mean
+        action = action.clamp(*self.action_range) # Clamp action to valid range
+        assert action.ndim == 2 and action.shape[0] == 1, "Action output shape incorrect."
+        return utils.to_np(action[0]) # Convert to numpy array for environment
 
     def update_critic(self, obs, obs_aug, action, reward, next_obs,
-                      next_obs_aug, not_done, logger, step):
-        with torch.no_grad():
-            dist = self.actor(next_obs)
+                      next_obs_aug, not_done, skills, logger, step):
+        """Updates the critic network(s)."""
+
+        # DIAYN: Compute intrinsic reward using current obs and skills.
+        # The choice of (obs, skill) vs (next_obs, skill) for r_i depends on DIAYN variant.
+        # Here, r_i = log D(skill | obs) - log p(skill)
+        if self.num_skills > 0:
+            intrinsic_reward = self.compute_intrinsic_reward(obs, skills) # Use current obs
+            logger.log('train_critic/intrinsic_reward', intrinsic_reward.mean(), step)
+            # Augment extrinsic reward with intrinsic reward
+            reward = reward + self.diayn_intrinsic_reward_coeff * intrinsic_reward
+            logger.log('train_critic/total_reward', reward.mean(), step) # Log total reward for critic
+
+        with torch.no_grad(): # Operations inside this block do not track gradients
+            # Get next action and its log probability from the actor for the target Q calculation
+            dist = self.actor(next_obs, skills if self.num_skills > 0 else None)
             next_action = dist.rsample()
-            log_prob = dist.log_prob(next_action).sum(-1, keepdim=True)
-            target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
-            target_V = torch.min(target_Q1,
-                                 target_Q2) - self.alpha.detach() * log_prob
-            target_Q = reward + (not_done * self.discount * target_V)
+            log_prob = dist.log_prob(next_action).sum(-1, keepdim=True) # Log prob of next action
+            target_Q1, target_Q2 = self.critic_target(next_obs, next_action) # Target Q-values from target critic
+            target_V = torch.min(target_Q1, target_Q2) - self.alpha.detach() * log_prob # Target value (SAC style)
+            target_Q = reward + (not_done * self.discount * target_V) # Bellman equation
 
-            dist_aug = self.actor(next_obs_aug)
+            # Repeat for augmented next observations (DrQ specific)
+            dist_aug = self.actor(next_obs_aug, skills if self.num_skills > 0 else None)
             next_action_aug = dist_aug.rsample()
-            log_prob_aug = dist_aug.log_prob(next_action_aug).sum(-1,
-                                                                  keepdim=True)
-            target_Q1, target_Q2 = self.critic_target(next_obs_aug,
-                                                      next_action_aug)
-            target_V = torch.min(
-                target_Q1, target_Q2) - self.alpha.detach() * log_prob_aug
-            target_Q_aug = reward + (not_done * self.discount * target_V)
+            log_prob_aug = dist_aug.log_prob(next_action_aug).sum(-1, keepdim=True)
+            target_Q1_aug, target_Q2_aug = self.critic_target(next_obs_aug, next_action_aug)
+            target_V_aug = torch.min(target_Q1_aug, target_Q2_aug) - self.alpha.detach() * log_prob_aug
+            target_Q_aug = reward + (not_done * self.discount * target_V_aug)
 
+            # Average target Q from original and augmented next_obs for data regularization
             target_Q = (target_Q + target_Q_aug) / 2
 
-        # get current Q estimates
+        # Get current Q estimates from the online critic
         current_Q1, current_Q2 = self.critic(obs, action)
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(
             current_Q2, target_Q)
@@ -259,15 +375,16 @@ class DRQAgent(object):
 
         self.critic.log(logger, step)
 
-    def update_actor_and_alpha(self, obs, logger, step):
-        # detach conv filters, so we don't update them with the actor loss
-        dist = self.actor(obs, detach_encoder=True)
-        action = dist.rsample()
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-        # detach conv filters, so we don't update them with the actor loss
-        actor_Q1, actor_Q2 = self.critic(obs, action, detach_encoder=True)
+    def update_actor_and_alpha(self, obs, skills, logger, step): # Added skills
+        # Detach encoder for actor update to prevent gradients from flowing back to encoder from actor loss
+        dist = self.actor(obs, skills if self.num_skills > 0 else None, detach_encoder=True)
+        action = dist.rsample() # Sample action from policy
+        log_prob = dist.log_prob(action).sum(-1, keepdim=True) # Log prob of sampled action
 
-        actor_Q = torch.min(actor_Q1, actor_Q2)
+        # Detach encoder for critic when used in actor loss calculation
+        # Actor_Q values are based on the critic, which is trained on augmented rewards if DIAYN is active.
+        actor_Q1, actor_Q2 = self.critic(obs, action, detach_encoder=True)
+        actor_Q = torch.min(actor_Q1, actor_Q2) # Use min Q-value for actor update (SAC style)
 
         actor_loss = (self.alpha.detach() * log_prob - actor_Q).mean()
 
@@ -291,17 +408,125 @@ class DRQAgent(object):
         self.log_alpha_optimizer.step()
 
     def update(self, replay_buffer, logger, step):
-        obs, action, reward, next_obs, not_done, obs_aug, next_obs_aug = replay_buffer.sample(
+        obs, action, reward, next_obs, not_done, obs_aug, next_obs_aug, skills = replay_buffer.sample(
             self.batch_size)
 
-        logger.log('train/batch_reward', reward.mean(), step)
+        # Note: extrinsic reward is already augmented with intrinsic_reward in update_critic if DIAYN is active.
+        # This step is where intrinsic rewards influence the policy via critic's Q-values.
 
+        # Update critic using observations, actions, and augmented rewards
         self.update_critic(obs, obs_aug, action, reward, next_obs,
-                           next_obs_aug, not_done, logger, step)
+                           next_obs_aug, not_done, skills, logger, step)
 
+        # Update actor and temperature alpha (SAC update)
         if step % self.actor_update_frequency == 0:
-            self.update_actor_and_alpha(obs, logger, step)
+            self.update_actor_and_alpha(obs, skills, logger, step) # Pass skills for skill-conditioned actor
 
+        # Update target critic network (soft update)
         if step % self.critic_target_update_frequency == 0:
-            utils.soft_update_params(self.critic, self.critic_target,
-                                     self.critic_tau)
+            utils.soft_update_params(self.critic, self.critic_target, self.critic_tau)
+
+        # DIAYN: Update discriminator
+        if self.num_skills > 0: # Only update discriminator if DIAYN is active
+            self.update_discriminator(obs, skills, logger, step) # Use current obs and skills from buffer
+
+    def compute_intrinsic_reward(self, obs, skill):
+        """
+        Computes the DIAYN intrinsic reward: r_i = log D(z|s) - log p(z).
+        Args:
+            obs (torch.Tensor): Batch of observations (states).
+            skill (torch.Tensor): Batch of skills (actions/latents z).
+        Returns:
+            torch.Tensor: Batch of intrinsic rewards.
+        """
+        if self.num_skills == 0: # Should not be called if no skills
+            return torch.zeros((obs.size(0), 1), device=self.device)
+
+        # Encode observation to get features (state representation)
+        # Use no_grad as this is for reward calculation, not for training the encoder here.
+        # detach=True on encoder output ensures no gradients flow back to encoder from discriminator.
+        with torch.no_grad():
+            features = self.critic.encoder(obs, detach=True)
+
+        # Get skill logits from discriminator D(z|s)
+        skill_logits = self.discriminator(features)
+
+        # Calculate log p(z|s) using cross-entropy trick or manual log_softmax
+        # skill is [batch_size, 1], .long() for gather
+        log_p_z_s = F.log_softmax(skill_logits, dim=-1).gather(1, skill.long())
+
+        # Calculate log p(z) - assuming a uniform prior over skills
+        # log p(z) = -log(num_skills) since p(z) = 1/num_skills
+        log_p_z_uniform = -torch.log(torch.tensor(self.num_skills, dtype=torch.float32, device=skill_logits.device))
+
+        intrinsic_reward = log_p_z_s - log_p_z_uniform
+
+        return intrinsic_reward.view(-1, 1) # Ensure shape [batch_size, 1]
+
+    def update_discriminator(self, obs, skill, logger, step):
+        """
+        Updates the DIAYN skill discriminator D(z|s).
+        Args:
+            obs (torch.Tensor): Batch of observations (states).
+            skill (torch.Tensor): Batch of skills (true labels for discriminator).
+            logger (Logger): Logger object for recording metrics.
+            step (int): Current training step.
+        """
+        # Get features from observation (state representation)
+        # Use no_grad as encoder is trained by critic/actor, not directly by discriminator.
+        with torch.no_grad():
+            features = self.critic.encoder(obs, detach=True)
+
+        # Predict skill logits using the discriminator
+        predicted_skill_logits = self.discriminator(features)
+
+        # Calculate discriminator loss (cross-entropy between predicted skill and actual skill)
+        # skill is [batch_size, 1], squeeze to [batch_size] for cross_entropy target.
+        discriminator_loss = F.cross_entropy(predicted_skill_logits, skill.squeeze(-1).long())
+
+        logger.log('train_discriminator/loss', discriminator_loss, step)
+
+        # Optimize the discriminator
+        self.discriminator_optimizer.zero_grad()
+        discriminator_loss.backward()
+        self.discriminator_optimizer.step()
+
+
+class Discriminator(nn.Module):
+    """
+    DIAYN Discriminator network D(z|s).
+    Predicts the skill 'z' given the current state 's'.
+    """
+    def __init__(self, feature_dim, num_skills, hidden_dim=1024, hidden_depth=2):
+        """
+        Args:
+            feature_dim (int): Dimension of the input features (from encoder).
+            num_skills (int): Number of skills to classify (output dimension).
+            hidden_dim (int): Dimension of hidden layers.
+            hidden_depth (int): Number of hidden layers.
+        """
+        super().__init__()
+        # MLP structure for the discriminator
+        # Note: utils.mlp typically adds a ReLU after the last linear layer if output_dim > 1.
+        # For classification logits, a final ReLU is undesirable.
+        # So, constructing layers manually here to ensure no final activation on logits.
+        layers = []
+        current_dim = feature_dim
+        for _ in range(hidden_depth):
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            current_dim = hidden_dim
+        layers.append(nn.Linear(current_dim, num_skills)) # Output layer for skill logits
+        self.trunk = nn.Sequential(*layers)
+
+        self.apply(utils.weight_init) # Apply weight initialization
+
+    def forward(self, features):
+        """
+        Forward pass of the discriminator.
+        Args:
+            features (torch.Tensor): Input features (encoded state).
+        Returns:
+            torch.Tensor: Logits for skill classification.
+        """
+        return self.trunk(features)
