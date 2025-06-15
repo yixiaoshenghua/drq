@@ -135,6 +135,11 @@ class Logger(object):
         self._eval_mg = MetersGroup(os.path.join(log_dir, 'eval'),
                                     formating=COMMON_EVAL_FORMAT)
 
+        # Define fieldnames for the new detailed per-episode CSV log
+        self._defined_episode_csv_fieldnames = ['type', 'episode', 'step', 'duration',
+                                                'episode_extrinsic_reward', 'skill_id',
+                                                'episode_intrinsic_reward_sum']
+
     def _should_log(self, step, log_frequency):
         log_frequency = log_frequency or self._log_frequency
         return step % log_frequency == 0
@@ -154,12 +159,15 @@ class Logger(object):
             grid = torchvision.utils.make_grid(image.unsqueeze(1))
             self._sw.add_image(key, grid, step)
 
-    def _try_sw_log_video(self, key, frames, step):
+    def _try_sw_log_video(self, key, frames, step, fps=25):
+        """Internal method to log video to TensorBoard."""
         step = self._update_step(step)
         if self._sw is not None:
-            frames = torch.from_numpy(np.array(frames))
-            frames = frames.unsqueeze(0)
-            self._sw.add_video(key, frames, step, fps=30)
+            # Input frames is expected to be a list of HWC uint8 numpy arrays (e.g., from VideoRecorder)
+            video_tensor = torch.from_numpy(np.array(frames))  # Converts list of (H,W,C) to (T,H,W,C)
+            # TensorBoard's add_video expects (N, T, C, H, W)
+            video_tensor = video_tensor.permute(0, 3, 1, 2).unsqueeze(0)  # (T,H,W,C) -> (T,C,H,W) -> (1,T,C,H,W)
+            self._sw.add_video(key, video_tensor, step, fps=fps)
 
     def _try_sw_log_histogram(self, key, histogram, step):
         step = self._update_step(step)
@@ -193,11 +201,12 @@ class Logger(object):
         assert key.startswith('train') or key.startswith('eval')
         self._try_sw_log_image(key, image, step)
 
-    def log_video(self, key, frames, step, log_frequency=None):
+    def log_video(self, key, frames, step, fps=25, log_frequency=None):
+        """Logs a video to TensorBoard."""
         if not self._should_log(step, log_frequency):
             return
-        assert key.startswith('train') or key.startswith('eval')
-        self._try_sw_log_video(key, frames, step)
+        assert key.startswith('train') or key.startswith('eval'), "Key for video log must start with 'train' or 'eval'"
+        self._try_sw_log_video(key, frames, step, fps=fps)
 
     def log_histogram(self, key, histogram, step, log_frequency=None):
         if not self._should_log(step, log_frequency):
@@ -216,3 +225,39 @@ class Logger(object):
             self._train_mg.dump(step, 'train', save)
         else:
             raise f'invalid log type: {ty}'
+
+    def log_episode_to_csv(self, episode_data):
+        """
+        Logs detailed per-episode data to a dedicated 'episodes.csv' file.
+        This allows for fine-grained analysis of episode-level performance,
+        including extrinsic rewards, intrinsic rewards, and skill IDs.
+
+        Args:
+            episode_data (dict): A dictionary containing data for a single episode.
+                                 Expected keys are defined in self._defined_episode_csv_fieldnames.
+        """
+        log_path = os.path.join(self._log_dir, 'episodes.csv')
+        file_exists = os.path.exists(log_path)
+
+        # Ensure all expected fieldnames are present in episode_data, filling with defaults if not.
+        # This makes the CSV robust to missing data points for an episode.
+        for field in self._defined_episode_csv_fieldnames:
+            if field not in episode_data:
+                if field == 'skill_id':
+                    episode_data[field] = -1  # Default for non-DIAYN or if skill is not applicable
+                elif field == 'episode_intrinsic_reward_sum':
+                    episode_data[field] = 0.0  # Default if intrinsic rewards are not used or applicable
+                elif field == 'duration':
+                    episode_data[field] = -1.0 # Default if duration is not tracked for this episode type (e.g., eval)
+                # Other fields are expected to be present.
+                # Consider adding a warning or error for other critical missing fields if necessary.
+
+        try:
+            with open(log_path, 'a', newline='') as f:
+                # Use DictWriter for robust CSV writing, ensuring columns align with headers.
+                writer = csv.DictWriter(f, fieldnames=self._defined_episode_csv_fieldnames)
+                if not file_exists or os.path.getsize(log_path) == 0:
+                    writer.writeheader()  # Write header only if file is new or empty
+                writer.writerow(episode_data)
+        except IOError as e:
+            print(f"Error writing to episodes.csv: {e}")
