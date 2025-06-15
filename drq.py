@@ -494,6 +494,32 @@ class DRQAgent(object):
         discriminator_loss.backward()
         self.discriminator_optimizer.step()
 
+    def save(self, save_path):
+        params_dict = {}
+        params_dict['actor'] = self.actor.state_dict()
+        params_dict['critic'] = self.critic.state_dict()
+        params_dict['critic_target'] = self.critic_target.state_dict()
+        params_dict['discriminator'] = self.discriminator.state_dict()
+        params_dict['log_alpha'] = self.log_alpha
+        params_dict['actor_optimizer'] = self.actor_optimizer.state_dict()
+        params_dict['critic_optimizer'] = self.critic_optimizer.state_dict()
+        params_dict['discriminator_optimizer'] = self.discriminator_optimizer.state_dict()
+        params_dict['log_alpha_optimizer'] = self.log_alpha_optimizer.state_dict()
+        torch.save(params_dict, save_path)
+
+    def load(self, load_path, device='cpu'):
+        params_dict = torch.load(load_path, map_location=device)
+        self.actor.load_state_dict(params_dict['actor'])
+        self.critic.load_state_dict(params_dict['critic'])
+        self.critic_target.load_state_dict(params_dict['critic_target'])
+        self.discriminator.load_state_dict(params_dict['discriminator'])
+        self.log_alpha = params_dict['log_alpha']
+        self.actor_optimizer.load_state_dict(params_dict['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(params_dict['critic_optimizer'])
+        self.discriminator_optimizer.load_state_dict(params_dict['discriminator_optimizer'])
+        self.log_alpha_optimizer.load_state_dict(params_dict['log_alpha_optimizer'])
+        
+
 
 class Discriminator(nn.Module):
     """

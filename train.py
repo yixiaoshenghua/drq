@@ -24,47 +24,10 @@ from logger import Logger # Handles logging to console, CSVs, and TensorBoard
 from replay_buffer import ReplayBuffer
 from video import VideoRecorder
 import drq # Import drq directly for DRQAgent
-
+import json
 from envs import make_env
 
 torch.backends.cudnn.benchmark = True
-
-
-# def make_env(args):
-#     """
-#     Helper function to create a dm_control environment.
-#     Uses args to specify environment name, seed, image size, action repeat, etc.
-#     """
-#     if args.task == 'ball_in_cup_catch':
-#         domain_name = 'ball_in_cup'
-#         task_name = 'catch'
-#     elif args.task == 'point_mass_easy':
-#         domain_name = 'point_mass'
-#         task_name = 'easy'
-#     else:
-#         domain_name = args.task.split('_')[0]
-#         task_name = '_'.join(args.task.split('_')[1:])
-
-#     # per dreamer: https://github.com/danijar/dreamer/blob/02f0210f5991c7710826ca7881f19c64a012290c/wrappers.py#L26
-#     camera_id = 2 if domain_name == 'quadruped' else 0
-
-#     env = dmc2gym.make(domain_name=domain_name,
-#                        task_name=task_name,
-#                        seed=args.seed,
-#                        visualize_reward=False,
-#                        from_pixels=True,
-#                        height=args.render_size,
-#                        width=args.render_size,
-#                        frame_skip=args.action_repeat,
-#                        camera_id=camera_id)
-
-#     env = utils.FrameStack(env, k=args.frame_stack)
-
-#     env.seed(args.seed)
-#     assert env.action_space.low.min() >= -1
-#     assert env.action_space.high.max() <= 1
-
-#     return env
 
 
 class Workspace(object):
@@ -78,7 +41,10 @@ class Workspace(object):
         # Create working directory for logs and outputs
         self.work_dir = f'./runs/{args.task}/{time.strftime("%Y%m%d-%H%M%S")}_seed{args.seed}'
         os.makedirs(self.work_dir, exist_ok=True)
+        os.makedirs(self.work_dir + '/models', exist_ok=True)
         print(f'Workspace directory: {self.work_dir}')
+        with open(os.path.join(self.work_dir, 'args.json'), 'w') as f:
+            json.dump(vars(args), f, sort_keys=True, indent=4)
 
         # Initialize logger (handles console, CSV, TensorBoard)
         self.logger = Logger(self.work_dir,
@@ -240,7 +206,8 @@ class Workspace(object):
                 self.logger.log(f'eval/skill_{eval_skill_id}/episode_reward', average_extrinsic_reward_for_skill, self.step)
                 self.logger.log(f'eval/skill_{eval_skill_id}/episode_intrinsic_reward_sum', average_intrinsic_reward_sum_for_skill, self.step)
 
-        self.logger.dump(self.step) # Dump aggregated CSV data (train.csv, eval.csv)
+        self.logger.dump(self.step, ty='eval') # Dump aggregated CSV data (train.csv, eval.csv)
+        self.agent.save(self.work_dir + f"/models/model_{self.step}.pt")
 
     def run(self):
         """Main training loop."""
@@ -261,9 +228,9 @@ class Workspace(object):
                     # Log TensorBoard metrics for the completed episode
                     self.logger.log('train/duration', episode_duration, self.step)
                     self.logger.log('train/episode_reward', current_episode_extrinsic_reward, self.step) # Extrinsic reward for TB
-                    if self.num_skills > 0:
-                        self.logger.log(f'train/skill_{self.current_skill_train}/episode_intrinsic_reward_sum',
-                                        current_episode_intrinsic_reward_sum, self.step)
+                    # if self.num_skills > 0:
+                    #     self.logger.log(f'train/skill_{self.current_skill_train}/episode_intrinsic_reward_sum',
+                    #                     current_episode_intrinsic_reward_sum, self.step)
 
                     # Log detailed episode data to episodes.csv
                     csv_log_data = {
@@ -275,7 +242,7 @@ class Workspace(object):
                     self.logger.log_episode_to_csv(csv_log_data)
 
                     # Dump aggregated CSVs (train.csv, eval.csv) and console output
-                    self.logger.dump(self.step, save=(self.step > self.args.num_seed_steps))
+                    self.logger.dump(self.step, save=(self.step > self.args.num_seed_steps), ty='train')
 
                 # Perform periodic evaluation
                 if self.step % self.args.eval_frequency == 0:
@@ -338,6 +305,8 @@ class Workspace(object):
             episode_step += 1
             self.step += 1
 
+        # save final model
+        self.agent.save(self.work_dir + '/models/final_model.pt')
 
 def main():
     parser = argparse.ArgumentParser(description="Train DrQ agent with optional DIAYN skill discovery.")
@@ -356,9 +325,10 @@ def main():
     parser.add_argument('--num_seed_steps', type=int, default=1000, help='Number of steps with random actions at the beginning.')
     parser.add_argument('--replay_buffer_capacity', type=int, default=100000, help='Capacity of the replay buffer.')
     parser.add_argument('--seed', type=int, default=1, help='Random seed for reproducibility.')
+    parser.add_argument('--save_model', type=lambda x: (str(x).lower() == 'true'), default=True)
 
     # Evaluation arguments
-    parser.add_argument('--eval_frequency', type=int, default=5000, help='Frequency (in steps) of evaluation phases.')
+    parser.add_argument('--eval_frequency', type=int, default=100000, help='Frequency (in steps) of evaluation phases.')
     parser.add_argument('--num_eval_episodes', type=int, default=1, help='Number of episodes per evaluation phase (and per skill if DIAYN).')
 
     # Logging and miscellaneous arguments
