@@ -40,16 +40,13 @@ class Workspace(object):
     def __init__(self, args):
         self.args = args
         # Create working directory for logs and outputs
-        self.work_dir = f'./runs/{args.task}/{time.strftime("%Y%m%d-%H%M%S")}_seed{args.seed}'
-        os.makedirs(self.work_dir, exist_ok=True)
-        os.makedirs(self.work_dir + '/models', exist_ok=True)
+        self.work_dir = args.work_dir
         print(f'Workspace directory: {self.work_dir}')
-        with open(os.path.join(self.work_dir, 'args.json'), 'w') as f:
-            json.dump(vars(args), f, sort_keys=True, indent=4)
 
         # Initialize logger (handles console, CSV, TensorBoard)
-        self.logger = Logger(self.work_dir,
-                             save_tb=args.log_save_tb,
+        os.makedirs(self.work_dir + '/test', exist_ok=True)
+        self.logger = Logger(self.work_dir + '/test',
+                             save_tb=False,
                              log_frequency=args.log_frequency_step,
                              agent=args.agent,
                              action_repeat=args.action_repeat)
@@ -91,6 +88,8 @@ class Workspace(object):
         # Instantiate DRQAgent with parameters derived from args
         self.agent = drq.DRQAgent(**agent_params)
 
+        self.agent.load(os.path.join(self.work_dir, "models", "final_model.pt"), device=self.device)
+
         # Initialize Replay Buffer
         self.replay_buffer = ReplayBuffer(self.env.obs_space['image'].shape,
                                           self.env.act_space['action'].shape,
@@ -98,13 +97,13 @@ class Workspace(object):
                                           args.image_pad, self.device)
 
         # Initialize Video Recorder
-        self.video_recorder = VideoRecorder(
-            self.work_dir if args.save_video else None, # Only enable if save_video is true
-            height=args.render_size,
-            width=args.render_size,
-            camera_id=camera_id,
-            fps=25                  # Standardized FPS for recordings
-        )
+        # self.video_recorder = VideoRecorder(
+        #     self.work_dir if args.save_video else None, # Only enable if save_video is true
+        #     height=args.render_size,
+        #     width=args.render_size,
+        #     camera_id=camera_id,
+        #     fps=25                  # Standardized FPS for recordings
+        # )
         self.step = 0 # Initialize global training step counter
 
         # DIAYN: Store num_skills and initialize current skill for training
@@ -164,7 +163,7 @@ class Workspace(object):
                 for episode_idx in range(self.args.num_eval_episodes):
                     timestep = self.env.reset()
                     obs = timestep['image']
-                    self.video_recorder.init(enabled=(episode_idx == 0 and self.args.save_video), skill_id=eval_skill_id)
+                    # self.video_recorder.init(enabled=(episode_idx == 0 and self.args.save_video), skill_id=eval_skill_id)
                     done = False
                     current_episode_extrinsic_reward = 0
                     current_episode_intrinsic_reward_sum = 0
@@ -180,16 +179,16 @@ class Workspace(object):
                         intrinsic_reward = self.agent.compute_intrinsic_reward(obs_tensor, current_skill_tensor).item()
                         current_episode_intrinsic_reward_sum += intrinsic_reward
 
-                        self.video_recorder.record(obs[:, :, :3], intrinsic_reward=intrinsic_reward) # Record frame with IR
+                        # self.video_recorder.record(obs[:, :, :3], intrinsic_reward=intrinsic_reward) # Record frame with IR
                         current_episode_extrinsic_reward += reward
                         obs = next_obs
 
                     total_extrinsic_reward_for_skill += current_episode_extrinsic_reward
                     total_intrinsic_reward_sum_for_skill += current_episode_intrinsic_reward_sum
 
-                    if episode_idx == 0 and self.args.save_video:
-                         self.logger.log_video(f'eval/skill_{eval_skill_id}/video', self.video_recorder.frames, self.step, fps=self.video_recorder.fps)
-                         self.video_recorder.save(f'{self.step}_skill_{eval_skill_id}.mp4') # save step will emptify frames
+                    # if episode_idx == 0 and self.args.save_video:
+                    #      self.logger.log_video(f'eval/skill_{eval_skill_id}/video', self.video_recorder.frames, self.step, fps=self.video_recorder.fps)
+                    #      self.video_recorder.save(f'{self.step}_skill_{eval_skill_id}.mp4') # save step will emptify frames
                          
 
                     # Log data for this evaluation episode to CSV
@@ -202,112 +201,13 @@ class Workspace(object):
                     self.logger.log_episode_to_csv(log_data)
 
                 # Log average rewards for this skill to TensorBoard
-                average_extrinsic_reward_for_skill = total_extrinsic_reward_for_skill / self.args.num_eval_episodes
-                average_intrinsic_reward_sum_for_skill = total_intrinsic_reward_sum_for_skill / self.args.num_eval_episodes
-                self.logger.log(f'eval/skill_{eval_skill_id}/episode_reward', average_extrinsic_reward_for_skill, self.step)
-                self.logger.log(f'eval/skill_{eval_skill_id}/episode_intrinsic_reward_sum', average_intrinsic_reward_sum_for_skill, self.step)
+                # average_extrinsic_reward_for_skill = total_extrinsic_reward_for_skill / self.args.num_eval_episodes
+                # average_intrinsic_reward_sum_for_skill = total_intrinsic_reward_sum_for_skill / self.args.num_eval_episodes
+                # self.logger.log(f'eval/skill_{eval_skill_id}/episode_reward', average_extrinsic_reward_for_skill, self.step)
+                # self.logger.log(f'eval/skill_{eval_skill_id}/episode_intrinsic_reward_sum', average_intrinsic_reward_sum_for_skill, self.step)
 
         self.logger.dump(self.step, ty='eval') # Dump aggregated CSV data (train.csv, eval.csv)
-        self.agent.save(self.work_dir + f"/models/model_{self.step}.pt")
-
-    def run(self):
-        """Main training loop."""
-        episode, episode_step, done = 0, 0, True # Initialize episode counters and done flag
-
-        # Initialize accumulators for the current training episode
-        current_episode_extrinsic_reward = 0
-        current_episode_intrinsic_reward_sum = 0
-        episode_start_time = time.time()
-
-        if self.num_skills > 0: # Log initial skill if DIAYN is active
-             self.logger.log('train/current_skill', self.current_skill_train, self.step)
-
-        while self.step < self.args.num_train_steps:
-            if done: # Marks the end of an episode and start of a new one
-                if self.step > 0: # Don't log metrics for the very first "done" state (step 0)
-                    episode_duration = time.time() - episode_start_time
-                    # Log TensorBoard metrics for the completed episode
-                    self.logger.log('train/duration', episode_duration, self.step)
-                    self.logger.log('train/episode_reward', current_episode_extrinsic_reward, self.step) # Extrinsic reward for TB
-                    # if self.num_skills > 0:
-                    #     self.logger.log(f'train/skill_{self.current_skill_train}/episode_intrinsic_reward_sum',
-                    #                     current_episode_intrinsic_reward_sum, self.step)
-
-                    # Log detailed episode data to episodes.csv
-                    csv_log_data = {
-                        'type': 'train', 'episode': episode, 'step': self.step, 'duration': episode_duration,
-                        'episode_extrinsic_reward': current_episode_extrinsic_reward,
-                        'skill_id': self.current_skill_train if self.num_skills > 0 else -1,
-                        'episode_intrinsic_reward_sum': current_episode_intrinsic_reward_sum if self.num_skills > 0 else 0.0
-                    }
-                    self.logger.log_episode_to_csv(csv_log_data)
-
-                    # Dump aggregated CSVs (train.csv, eval.csv) and console output
-                    self.logger.dump(self.step, save=(self.step > self.args.num_seed_steps), ty='train')
-
-                # Perform periodic evaluation
-                if self.step % self.args.eval_frequency == 0:
-                    self.logger.log('eval/episode', episode, self.step) # Log current training episode for context
-                    self.evaluate()
-
-                # Reset environment and episode-specific counters for the new episode
-                timestep = self.env.reset()
-                obs = timestep['image']
-                done = False
-                current_episode_extrinsic_reward = 0
-                current_episode_intrinsic_reward_sum = 0
-                episode_step = 0
-                episode += 1
-                self.logger.log('train/episode', episode, self.step)
-                episode_start_time = time.time() # Reset episode timer
-
-                # DIAYN: Sample a new skill for the new episode
-                if self.num_skills > 0:
-                    self.current_skill_train = np.random.randint(0, self.num_skills)
-                    self.logger.log('train/current_skill', self.current_skill_train, self.step)
-
-            # Store current observation; this will be added to replay buffer as 's_t'
-            obs_for_replay_buffer = obs
-
-            # Sample action from agent
-            if self.step < self.args.num_seed_steps: # Random actions for seed steps
-                action = self.env.act_space['action'].sample()
-            else: # Policy actions
-                with utils.eval_mode(self.agent): # Use agent in eval mode for action selection
-                    action = self.agent.act(obs_for_replay_buffer, self.current_skill_train, sample=True)
-
-            # Perform agent update steps
-            if self.step >= self.args.num_seed_steps:
-                for _ in range(self.args.num_train_iters): # Typically 1 iter for online RL
-                    self.agent.update(self.replay_buffer, self.logger, self.step)
-
-            # Take step in the environment
-            timestep = self.env.step({'action': action})
-            next_obs, reward, done = timestep['image'], timestep['reward'], timestep['is_terminal']
-
-            current_episode_extrinsic_reward += reward # Accumulate extrinsic reward
-
-            # DIAYN: Compute intrinsic reward for the current step (s_t, z_t)
-            if self.num_skills > 0:
-                obs_tensor = torch.FloatTensor(obs_for_replay_buffer).unsqueeze(0).to(self.device)
-                skill_tensor = torch.tensor([self.current_skill_train], device=self.device).long()
-                intrinsic_reward_at_step = self.agent.compute_intrinsic_reward(obs_tensor, skill_tensor).item()
-                current_episode_intrinsic_reward_sum += intrinsic_reward_at_step
-
-            # Handle 'done' for replay buffer (distinguish timeout from actual done)
-            done_float = float(done)
-            # done_no_max = 0 if episode_step + 1 == self.env._max_episode_steps else done_float
-
-            # Add transition to replay buffer
-            self.replay_buffer.add(obs_for_replay_buffer, action, reward, next_obs, done_float,
-                                   done_float, self.current_skill_train)
-
-            obs = next_obs # Update observation for next step
-            episode_step += 1
-            self.step += 1
-
-        # save final model
-        self.agent.save(self.work_dir + '/models/final_model.pt')
+        # self.agent.save(self.work_dir + f"/models/model_{self.step}.pt")
 
 def main():
     parser = argparse.ArgumentParser(description="Train DrQ agent with optional DIAYN skill discovery.")
@@ -321,6 +221,7 @@ def main():
     parser.add_argument('--camera', type=str, default='corner')
 
     # Training lifecycle arguments
+    parser.add_argument('--work_dir', type=str, default="")
     parser.add_argument('--num_train_steps', type=int, default=1000000, help='Total number of environment steps for training.')
     parser.add_argument('--num_train_iters', type=int, default=1, help='Number of agent updates per environment step after seed steps.')
     parser.add_argument('--num_seed_steps', type=int, default=1000, help='Number of steps with random actions at the beginning.')
@@ -376,7 +277,7 @@ def main():
     # If a flag like --no-save-video is preferred for a default True, then action='store_false' and dest='save_video' would be used.
 
     workspace = Workspace(args)
-    workspace.run()
+    workspace.evaluate()
 
 
 if __name__ == '__main__':
